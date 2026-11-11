@@ -357,8 +357,9 @@ private:
         const auto phase_now = [] { return std::chrono::steady_clock::now(); };
         const auto phase_t0 = phase_now();
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
+        const auto pre_code = [this](u64 pc, A64::IREmitter& ir) { conf.callbacks->PreCodeTranslationHook(pc, ir); };
         IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions});
+                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions, pre_code});
         const auto phase_t1 = phase_now();
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);

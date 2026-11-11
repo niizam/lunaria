@@ -14,6 +14,8 @@
 #define _DARWIN_C_SOURCE 1
 #endif
 
+#include "dynarmic/frontend/A64/a64_ir_emitter.h"
+#include "dynarmic/frontend/A64/a64_types.h"
 #include "lunaria_os.h"
 #include "lunaria_file.h"
 #include "lib/inc/log_assert.h"
@@ -116,6 +118,7 @@ static const uint32_t cxa_guard_abort_code64[] = {
 #include <ctime>
 #define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/aes.h>
+#include <openssl/evp.h>
 #include <openssl/des.h>
 #include <openssl/sha.h>
 #include <ctype.h>
@@ -65463,7 +65466,864 @@ static void a64_install_code_hooks(ArmExecCtx &ctx) {
   }
 }
 
+/* ---- LUNARIA_FGO_HTTP: the game's own requests, in plain text ------------
+ *
+ * Fate/Grand Order's API calls are encrypted by the libcurl inside libunity,
+ * so a packet capture shows only TLS records.  The request and the reply exist
+ * in plain form in managed memory on either side of that.  This watches managed
+ * methods of libil2cpp.so, found by their offset within the image:
+ *
+ *   LUNARIA_FGO_HTTP=<name>:<hex-offset>[,<name>:<hex-offset>...]
+ *
+ * capture/fgo_hook_env.py writes that value from the IL2CPP dump.  The hook is
+ * placed at translation time (Dynarmic's PreCodeTranslationHook), so it runs on
+ * every entry, including entries reached by linked jumps.  A name containing
+ * getURL or get_data is logged where it returns: the hook is put on each RET in
+ * the method's first kBodyBytes, and it reads x0 there.  Any other name logs its
+ * string arguments on entry.  Diagnostics only: guest memory is read, never
+ * written. */
+namespace fgo_http {
+/* ---- LUNARIA_FGO_PLAY: play one quest from inside the game's session ----
+ *
+ * Loading this file with LUNARIA_FGO_PLAY=<questId>:<phase>:<followerId> makes
+ * the hook run one battle through the game's own session, once the game is at
+ * the home screen: battle/setup, then battle/result built from a captured
+ * result template.  Requests are signed like the game's (SHA-1 over the sorted
+ * fields plus secretKey), and sent with dvm_http_perform, the same client the
+ * emulator's own network layer uses.  The URLs, the MessagePack body and the
+ * cipher are the ones in bot/play.py, checked against a captured request. */
+struct FgoPlay {
+  std::string quest, phase, follower;
+  std::string user_id, auth_key, secret, ver_code, folder, app_ver;
+  std::string app_check_err;   /* the game's last appCheckErrorMessage, reused */
+  bool armed = false, done = false;
+};
+static FgoPlay g_play;
+
+static void play_load_config() {
+  const char *e = lunaria_env("LUNARIA_FGO_PLAY");
+  if (!e || !*e) return;
+  char id[32] = {}, phase[32] = {}, fol[32] = {};
+  if (sscanf(e, "%31[^:]:%31[^:]:%31s", id, phase, fol) < 2) return;
+  g_play.quest = id;
+  g_play.phase = phase;
+  g_play.follower = fol;
+  const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+  std::string base = dir && *dir ? dir : "fgo-http";
+  auto readfile = [&](const char *name) {
+    std::string out;
+    FILE *f = fopen((base + "/" + name).c_str(), "rb");
+    if (!f) return out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    fclose(f);
+    return out;
+  };
+  std::string cfg = readfile("play-config.txt");
+  auto field = [&](const char *key) {
+    std::string pat = std::string(key) + "=";
+    size_t p = cfg.find(pat);
+    if (p == std::string::npos) return std::string();
+    p += pat.size();
+    size_t q = cfg.find('\n', p);
+    return cfg.substr(p, q == std::string::npos ? std::string::npos : q - p);
+  };
+  g_play.user_id = field("userId");
+  g_play.auth_key = field("authKey");
+  g_play.secret = field("secretKey");
+  g_play.ver_code = field("verCode");
+  g_play.folder = field("assetbundleFolder");
+  g_play.app_ver = field("appVer");
+  if (g_play.user_id.empty() || g_play.auth_key.empty() || g_play.secret.empty()) {
+    fprintf(stderr, "[fgo-play] disabled: play-config.txt lacks credentials\n");
+    return;
+  }
+  g_play.armed = true;
+  /* A cookie left by an earlier run belongs to a dead session; play.py waits
+   * for the hook to write this run's. */
+  unlink((base + "/session-cookie.txt").c_str());
+  fprintf(stderr, "[fgo-play] armed: quest %s phase %s follower %s\n",
+          g_play.quest.c_str(), g_play.phase.c_str(), g_play.follower.c_str());
+}
+
+static std::string play_sha1_b64(const std::string &text) {
+  unsigned char md[20];
+  unsigned int n = 0;
+  EVP_Digest(text.data(), text.size(), md, &n, EVP_sha1(), nullptr);
+  static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  for (unsigned i = 0; i < n; i += 3) {
+    uint32_t v = (uint32_t)md[i] << 16;
+    if (i + 1 < n) v |= (uint32_t)md[i+1] << 8;
+    if (i + 2 < n) v |= md[i+2];
+    out += tbl[(v >> 18) & 63];
+    out += tbl[(v >> 12) & 63];
+    out += i + 1 < n ? tbl[(v >> 6) & 63] : '=';
+    out += i + 2 < n ? tbl[v & 63] : '=';
+  }
+  return out;
+}
+
+static void play_uuid(char *out, size_t cap) {
+  static uint64_t seed = (uint64_t)time(nullptr) ^ ((uint64_t)getpid() << 32);
+  unsigned char b[16];
+  for (int i = 0; i < 16; ++i) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; b[i] = (unsigned char)(seed >> 56); }
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  snprintf(out, cap, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+}
+
+/* Percent-encoding as the game's form encoder does it. */
+static std::string play_urlencode(const std::string &in) {
+  std::string out;
+  for (unsigned char c : in) {
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+    else { char b[4]; snprintf(b, sizeof b, "%%%02X", c); out += b; }
+  }
+  return out;
+}
+
+static void play_post(const char *endpoint, std::vector<std::pair<std::string, std::string>> &form,
+                      std::string &reply) {
+  std::string body;
+  for (size_t i = 0; i < form.size(); ++i) {
+    if (i) body += '&';
+    body += play_urlencode(form[i].first) + "=" + play_urlencode(form[i].second);
+  }
+  std::string url = std::string("https://game.fate-go.us/") + endpoint +
+                    "?_userId=" + play_urlencode(g_play.user_id);
+  struct dvm_http_header h[2] = {
+    {(char *)"Content-Type", (char *)"application/x-www-form-urlencoded"},
+    {(char *)"User-Agent", (char *)"Dalvik/2.1.0 (Linux; U; Android 12; Pixel 6 Build/SQ3A.220705.003.A1)"},
+  };
+  struct dvm_http_response resp = {};
+  const bool ok = dvm_http_perform("POST", url.c_str(), h, 2,
+                                   (const uint8_t *)body.data(), body.size(), 60000, true, &resp);
+  reply.clear();
+  if (resp.body && resp.body_len) reply.assign((const char *)resp.body, resp.body_len);
+  fprintf(stderr, "[fgo-play] POST %s -> status %d%s%s\n", endpoint, resp.status,
+          ok ? "" : " error ", resp.error);
+}
+static void play_run() {
+  if (!g_play.armed || g_play.done) return;
+  g_play.done = true;
+  fprintf(stderr, "[fgo-play] running quest %s\n", g_play.quest.c_str());
+  /* The result body is MessagePack encrypted with Rijndael-256, and the
+   * verified implementation of that (and of the packer) is the Python one in
+   * bot/play.py.  Run it as a child: the game keeps its session, the child
+   * makes the requests with the same credentials, and the game waits for it
+   * once, at the home screen.  The child is detached: the game's UI thread
+   * must not block here, and the bot's requests are independent of it. */
+  const char *script = lunaria_env("LUNARIA_FGO_PLAY_SCRIPT");
+  if (!script || !*script) script = "play.py";
+  const char *py = lunaria_env("LUNARIA_FGO_PLAY_PYTHON");
+  if (!py || !*py) py = "python3";
+  const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+  if (!dir || !*dir) dir = "fgo-http";
+  char cmd[1024];
+  snprintf(cmd, sizeof cmd, "%s %s play %s %s %s > %s/play.log 2>&1 &",
+           py, script, g_play.quest.c_str(), g_play.phase.c_str(),
+           g_play.follower.c_str(), dir);
+  fprintf(stderr, "[fgo-play] %s\n", cmd);
+  const int rc = system(cmd);
+  fprintf(stderr, "[fgo-play] child started (%d)\n", rc);
+}
+
+constexpr uint64_t kBodyBytes = 0x800;
+
+/* The request being built (SetRequestHeader and set_method calls go here until
+ * Post hands it over), the URL the last armed concatenation produced, and the
+ * requests sent but not yet answered, oldest first. */
+struct FgoRequest {
+  std::string method, url;
+  std::vector<std::pair<std::string, std::string>> headers;
+  std::vector<std::pair<std::string, std::string>> form;
+  std::string body;  /* raw upload (UploadHandlerRaw), if any */
+};
+static FgoRequest s_building;   /* headers and form fields, shared by the next request */
+static uint64_t s_building_obj = 0;  /* the object addField fields are meant for */
+static std::map<uint64_t, FgoRequest> s_req;  /* per UnityWebRequest object */
+static std::map<uint64_t, std::string> s_handler_body;  /* UploadHandlerRaw -> bytes */
+static std::string s_global_body;  /* UploadHandlerRaw.Create: no request yet */
+static std::string s_last_url;
+static std::vector<FgoRequest> s_sent;
+
+
+struct Watch {
+  std::string name;
+  uint64_t off = 0, va = 0;
+  bool on_return = false;
+};
+static bool s_parsed = false;
+static std::vector<Watch> s_watch;
+static uint64_t s_bias = 0;
+static bool s_ready = false;
+static uint64_t s_lo = ~0ull, s_hi = 0;
+
+static bool enabled() {
+  static const bool on = lunaria_env("LUNARIA_FGO_HTTP") != nullptr;
+  return on;
+}
+
+static void parse_once() {
+  s_parsed = true;
+  const char *e = lunaria_env("LUNARIA_FGO_HTTP");
+  if (!e) return;
+  const std::string all(e);
+  size_t pos = 0;
+  while (pos < all.size()) {
+    size_t comma = all.find(',', pos);
+    if (comma == std::string::npos) comma = all.size();
+    const std::string item = all.substr(pos, comma - pos);
+    pos = comma + 1;
+    const size_t colon = item.rfind(':');
+    if (colon == std::string::npos || colon == 0) continue;
+    Watch w;
+    w.name = item.substr(0, colon);
+    w.off = strtoull(item.c_str() + colon + 1, nullptr, 16);
+    w.on_return = w.name.find("GetAuthCode") != std::string::npos ||
+                  w.name.find("getURL") != std::string::npos ||
+                  w.name.find("get_data") != std::string::npos ||
+                  w.name.find("get_text") != std::string::npos ||
+                  w.name.find("EncryptDecrypt") != std::string::npos ||
+                  w.name.find("Concat") != std::string::npos;
+    s_watch.push_back(w);
+  }
+}
+
+static uint64_t il2cpp_bias() {
+  if (s_bias) return s_bias;
+  for (const auto &m : g_module_phdrs) {
+    if (!m.is_64) continue;
+    const char *n = g_ctx->mem.cstr(m.name_va);
+    if (n && strstr(n, "libil2cpp") && !s_bias) s_bias = m.load_bias;
+  }
+  return s_bias;
+}
+
+/* An Il2CppString: klass, monitor, int32 length at 0x10, UTF-16 chars at
+ * 0x14.  A pointer that merely looks like one is rejected by its contents. */
+static bool read_string(GuestVA va, std::string &out) {
+  if (!va) return false;
+  const uint8_t *h = g_ctx->mem.try_ptr(va, 0x14);
+  if (!h) return false;
+  int32_t len = 0;
+  std::memcpy(&len, h + 0x10, 4);
+  if (len < 0 || len > 4096) return false;
+  const uint8_t *c = len ? g_ctx->mem.try_ptr(va + 0x14, (size_t)len * 2) : h;
+  if (!c) return false;
+  out.clear();
+  int text = 0;
+  for (int i = 0; i < len; ++i) {
+    uint16_t u;
+    std::memcpy(&u, c + 2 * i, 2);
+    if (u >= 32 && u < 127) {
+      out += (char)u;
+      ++text;
+    } else {
+      out += '.';
+    }
+  }
+  return len == 0 || text * 10 >= len * 9;
+}
+
+/* An Il2CppArraySize of bytes: max_length at 0x18, data at 0x20. */
+static void log_bytes(const char *name, GuestVA va) {
+  if (!va) {
+    fprintf(stderr, "[fgo-http] %s -> (null)\n", name);
+    return;
+  }
+  const uint8_t *h = g_ctx->mem.try_ptr(va, 0x20);
+  if (!h) {
+    fprintf(stderr, "[fgo-http] %s -> (unreadable)\n", name);
+    return;
+  }
+  uint64_t n = 0;
+  std::memcpy(&n, h + 0x18, 8);
+  if (n > (1u << 20)) n = 1u << 20;
+  const uint8_t *d = n ? g_ctx->mem.try_ptr(va + 0x20, (size_t)n) : h;
+  if (!d) {
+    fprintf(stderr, "[fgo-http] %s -> %llu bytes (unreadable)\n", name,
+            (unsigned long long)n);
+    return;
+  }
+  std::string text;
+  for (uint64_t i = 0; i < n && i < 4096; ++i) {
+    const uint8_t c = d[i];
+    text += (c >= 32 && c < 127) || c == '\n' || c == '\r' || c == '\t' ? (char)c : '.';
+  }
+  fprintf(stderr, "[fgo-http] %s -> %llu bytes\n[fgo-http] %s data: %s\n", name,
+          (unsigned long long)n, name, text.c_str());
+}
+
+/* Resolve the watch table once the image is mapped.  Each method's first
+ * instruction words go out too: a managed method starts with a frame setup
+ * (stp or sub sp), which shows whether the offset is right. */
+static void resolve_once() {
+  if (!s_parsed) parse_once();
+  const uint64_t bias = il2cpp_bias();
+  if (!bias || s_watch.empty()) return;
+  for (auto &w : s_watch) {
+    w.va = bias + w.off;
+    s_lo = std::min(s_lo, w.va);
+    s_hi = std::max(s_hi, w.va);
+    const uint8_t *code = g_ctx->mem.try_ptr((GuestVA)w.va, 16);
+    fprintf(stderr, "[fgo-http] %s at %#llx:", w.name.c_str(), (unsigned long long)w.va);
+    for (int k = 0; code && k < 4; ++k) {
+      uint32_t insn;
+      std::memcpy(&insn, code + 4 * k, 4);
+      fprintf(stderr, " %08x", insn);
+    }
+    fprintf(stderr, "%s\n", code ? "" : " (unmapped)");
+  }
+  s_ready = true;
+}
+
+/* application/x-www-form-urlencoded escaping, as the game's encoder does it. */
+static std::string url_encode(const std::string &in) {
+  std::string out;
+  for (unsigned char c : in) {
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else {
+      char b[4];
+      snprintf(b, sizeof b, "%%%02X", c);
+      out += b;
+    }
+  }
+  return out;
+}
+
+/* Every game API request is written to its own file when it is sent, so its
+ * body survives whatever happens to the replies. */
+static void save_request_file(const FgoRequest &req) {
+  static int seq = 0;
+  const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+  if (!dir || !*dir) dir = "fgo-http";
+  mkdir(dir, 0755);
+  char path[512];
+  snprintf(path, sizeof path, "%s/request-%03d.txt", dir, ++seq);
+  FILE *f = fopen(path, "wb");
+  if (!f) return;
+  fprintf(f, "%s %s\n", req.method.c_str(), req.url.c_str());
+  for (size_t k = 0; k < req.headers.size(); ++k) {
+    bool seen = false;
+    for (size_t j = 0; j < k && !seen; ++j) seen = req.headers[j] == req.headers[k];
+    if (!seen) fprintf(f, "%s: %s\n", req.headers[k].first.c_str(), req.headers[k].second.c_str());
+  }
+  fprintf(f, "\n");
+  if (req.form.empty() && !req.body.empty()) {
+    bool text = true;
+    for (unsigned char c : req.body)
+      if (c < 9 || (c > 13 && c < 32) || c == 127) { text = false; break; }
+    if (text) {
+      fwrite(req.body.data(), 1, req.body.size(), f);
+    } else {
+      static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      fprintf(f, "(base64) ");
+      for (size_t i = 0; i < req.body.size(); i += 3) {
+        uint32_t v = (uint8_t)req.body[i] << 16;
+        if (i + 1 < req.body.size()) v |= (uint8_t)req.body[i + 1] << 8;
+        if (i + 2 < req.body.size()) v |= (uint8_t)req.body[i + 2];
+        fputc(tbl[(v >> 18) & 63], f);
+        fputc(tbl[(v >> 12) & 63], f);
+        fputc(i + 1 < req.body.size() ? tbl[(v >> 6) & 63] : '=', f);
+        fputc(i + 2 < req.body.size() ? tbl[v & 63] : '=', f);
+      }
+    }
+    fprintf(f, "\n");
+  }
+  if (!req.form.empty()) {
+    for (size_t k = 0; k < req.form.size(); ++k) {
+      if (k) fputc('&', f);
+      fputs(url_encode(req.form[k].first).c_str(), f);
+      fputc('=', f);
+      fputs(url_encode(req.form[k].second).c_str(), f);
+    }
+    fprintf(f, "\n");
+  }
+  fclose(f);
+  fprintf(stderr, "[fgo-http] request %s\n", path);
+}
+
+/* A reply body (Il2CppArraySize of bytes) that is JSON is written in full to
+ * $LUNARIA_FGO_HTTP_DIR (default ./fgo-http), one file per reply, and only its
+ * size and file name go to the log.  Other bodies (Unity's own downloads) are
+ * not written. */
+static void save_reply_bytes(const std::string &data);
+static std::string array_bytes(uint64_t arr);
+
+static void save_body(uint64_t va) {
+  const std::string data = array_bytes(va);
+  if (!data.empty()) save_reply_bytes(data);
+}
+
+/* A UTF-16 Il2CppString as UTF-8, up to a limit well above read_string's. */
+static std::string il2cpp_text(uint64_t va) {
+  const uint8_t *h = va ? g_ctx->mem.try_ptr((GuestVA)va, 0x14) : nullptr;
+  if (!h) return std::string();
+  int32_t len = 0;
+  std::memcpy(&len, h + 0x10, 4);
+  if (len <= 0 || len > (16 << 20)) return std::string();
+  const uint8_t *c = g_ctx->mem.try_ptr((GuestVA)va + 0x14, (size_t)len * 2);
+  if (!c) return std::string();
+  std::string out;
+  out.reserve((size_t)len);
+  for (int k = 0; k < len; ++k) {
+    uint16_t u;
+    std::memcpy(&u, c + 2 * k, 2);
+    out += u < 128 ? (char)u : '?';
+  }
+  return out;
+}
+
+static void save_reply_bytes(const std::string &data) {
+  if (data.empty() || (data[0] != '{' && data[0] != '[')) return;
+  const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+  if (!dir || !*dir) dir = "fgo-http";
+  static int seq = 0;
+  mkdir(dir, 0755);
+  FgoRequest req;
+  size_t pick = s_sent.empty() ? s_sent.size() : 0;
+  if (pick < s_sent.size()) {
+    req = s_sent[pick];
+    s_sent.erase(s_sent.begin() + (long)pick);
+  }
+  char path[512];
+  snprintf(path, sizeof path, "%s/reply-%03d.txt", dir, ++seq);
+  FILE *f = fopen(path, "wb");
+  if (!f) return;
+  if (!req.url.empty()) fprintf(f, "%s %s\n", req.method.c_str(), req.url.c_str());
+  else fprintf(f, "(no matching request)\n");
+  for (size_t k = 0; k < req.headers.size(); ++k) {
+    bool seen = false;
+    for (size_t j = 0; j < k && !seen; ++j) seen = req.headers[j] == req.headers[k];
+    if (!seen) fprintf(f, "%s: %s\n", req.headers[k].first.c_str(), req.headers[k].second.c_str());
+  }
+  fprintf(f, "\n");
+  fwrite(data.data(), 1, data.size(), f);
+  fclose(f);
+  fprintf(stderr, "[fgo-http] reply %zu bytes -> %s (%s)\n", data.size(), path,
+          req.url.empty() ? "no request" : req.url.c_str());
+}
+
+#if 0
+static void save_body(uint64_t va) {
+  const uint8_t *h = va ? g_ctx->mem.try_ptr((GuestVA)va, 0x20) : nullptr;
+  if (!h) return;
+  uint64_t n = 0;
+  std::memcpy(&n, h + 0x18, 8);
+  if (n == 0 || n > (16u << 20)) return;
+  const uint8_t *d = g_ctx->mem.try_ptr((GuestVA)va + 0x20, (size_t)n);
+  if (!d || (d[0] != '{' && d[0] != '[')) return;
+  /* The oldest request still waiting, preferring the game's own hosts. */
+  FgoRequest req;
+  /* The game sends its API calls one after another, so a JSON reply belongs to
+   * the oldest API request still waiting. */
+  size_t pick = s_sent.empty() ? s_sent.size() : 0;
+  if (pick < s_sent.size()) {
+    req = s_sent[pick];
+    s_sent.erase(s_sent.begin() + (long)pick);
+  }
+  static int seq = 0;
+  const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+  if (!dir || !*dir) dir = "fgo-http";
+  mkdir(dir, 0755);
+  char path[512];
+  snprintf(path, sizeof path, "%s/reply-%03d.txt", dir, ++seq);
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    fprintf(stderr, "[fgo-http] cannot write %s\n", path);
+    return;
+  }
+  if (pick < s_sent.size() || !req.url.empty())
+    fprintf(f, "%s %s\n", req.method.c_str(), req.url.c_str());
+  else
+    fprintf(f, "(no matching request)\n");
+  for (size_t k = 0; k < req.headers.size(); ++k) {
+    bool seen = false;
+    for (size_t j = 0; j < k && !seen; ++j) seen = req.headers[j] == req.headers[k];
+    if (!seen) fprintf(f, "%s: %s\n", req.headers[k].first.c_str(), req.headers[k].second.c_str());
+  }
+  fprintf(f, "\n");
+  if (req.form.empty() && !req.body.empty()) {
+    bool text = true;
+    for (unsigned char c : req.body)
+      if (c < 9 || (c > 13 && c < 32) || c == 127) { text = false; break; }
+    if (text) {
+      fwrite(req.body.data(), 1, req.body.size(), f);
+    } else {
+      static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      fprintf(f, "(base64) ");
+      for (size_t i = 0; i < req.body.size(); i += 3) {
+        uint32_t v = (uint8_t)req.body[i] << 16;
+        if (i + 1 < req.body.size()) v |= (uint8_t)req.body[i + 1] << 8;
+        if (i + 2 < req.body.size()) v |= (uint8_t)req.body[i + 2];
+        fputc(tbl[(v >> 18) & 63], f);
+        fputc(tbl[(v >> 12) & 63], f);
+        fputc(i + 1 < req.body.size() ? tbl[(v >> 6) & 63] : '=', f);
+        fputc(i + 2 < req.body.size() ? tbl[v & 63] : '=', f);
+      }
+    }
+    fprintf(f, "\n\n");
+  }
+  if (!req.form.empty()) {
+    /* The form body as sent, application/x-www-form-urlencoded, in call order. */
+    for (size_t k = 0; k < req.form.size(); ++k) {
+      if (k) fputc('&', f);
+      fputs(url_encode(req.form[k].first).c_str(), f);
+      fputc('=', f);
+      fputs(url_encode(req.form[k].second).c_str(), f);
+    }
+    fprintf(f, "\n\n");
+  }
+  fwrite(d, 1, (size_t)n, f);
+  fclose(f);
+  fprintf(stderr, "[fgo-http] reply %llu bytes -> %s (%s)\n", (unsigned long long)n, path,
+          req.url.empty() ? "no request" : req.url.c_str());
+}
+#endif
+
+static std::string array_bytes(uint64_t arr) {
+  const uint8_t *h = arr ? g_ctx->mem.try_ptr((GuestVA)arr, 0x20) : nullptr;
+  if (!h) return std::string();
+  uint64_t n = 0;
+  std::memcpy(&n, h + 0x18, 8);
+  if (n == 0 || n > (16u << 20)) return std::string();
+  const uint8_t *d = g_ctx->mem.try_ptr((GuestVA)arr + 0x20, (size_t)n);
+  if (!d) return std::string();
+  return std::string((const char *)d, (size_t)n);
+}
+
+
+/* Called from generated code, with the arguments the method was entered with. */
+/* Concatenation results are logged only between TopLoginRequest.beginRequest
+ * and the first URL they produce: String.Concat runs thousands of times a
+ * frame, and logging each one stops the game. */
+static bool s_armed = false;
+
+static void host_entry(uint64_t idx, uint64_t a1, uint64_t a2) {
+  if (idx >= s_watch.size()) return;
+  const Watch &w = s_watch[idx];
+  if (w.name.find("beginRequest") != std::string::npos) {
+    s_armed = true;
+    fprintf(stderr, "[fgo-http] %s entered\n", w.name.c_str());
+    return;
+  }
+  /* Per request: the UnityWebRequest object is the first argument. */
+  if (w.name.find("set_url") != std::string::npos) {
+    std::string u;
+    if (read_string((GuestVA)a2, u)) s_req[a1].url = u;
+    s_building_obj = a1;
+    return;
+  }
+  if (w.name.find("set_method") != std::string::npos) {
+    std::string m;
+    if (read_string((GuestVA)a2, m)) s_req[a1].method = m;
+    s_building_obj = a1;
+    return;
+  }
+  if (w.name.find("SetUploadHandler") != std::string::npos ||
+      w.name.find("set_uploadHandler") != std::string::npos) {
+    /* The handler came from .ctor (keyed by its object) or from Create (the
+     * body waits in s_global_body until the handler is set). */
+    auto it = s_handler_body.find(a2);
+    const char *how = "none";
+    if (it != s_handler_body.end()) {
+      s_req[a1].body = it->second;
+      s_handler_body.erase(it);
+      how = "handler";
+    } else if (!s_global_body.empty()) {
+      s_req[a1].body = s_global_body;
+      s_global_body.clear();
+      how = "global";
+    }
+    fprintf(stderr, "[fgo-http] %s req=%#llx handler=%#llx linked=%s (%zu bytes)\n",
+            w.name.c_str(), (unsigned long long)a1, (unsigned long long)a2, how, s_req[a1].body.size());
+    return;
+  }
+  if (w.name.find("UploadHandlerRaw") != std::string::npos) {
+    if (w.name.find("Create") != std::string::npos) {
+      s_global_body = array_bytes(a1);
+      fprintf(stderr, "[fgo-http] UploadHandlerRaw.Create %zu bytes\n", s_global_body.size());
+    } else if (s_handler_body.size() < 64) {
+      /* .ctor(this = handler, data = byte[]).  A handler gets two constructor
+       * calls, and the second one does not carry the array: keep the first
+       * non-empty body and never replace it with an empty one. */
+      std::string bytes = array_bytes(a2);
+      if (!bytes.empty() && !s_handler_body.count(a1)) s_handler_body[a1] = bytes;
+      fprintf(stderr, "[fgo-http] UploadHandlerRaw.ctor handler=%#llx %zu bytes\n",
+              (unsigned long long)a1, bytes.size());
+    }
+    return;
+  }
+  if (w.name.find("Deserialize") != std::string::npos || w.name.find("getDictionary") != std::string::npos) {
+    if (lunaria_env("LUNARIA_FGO_PLAY") && w.name.find("Deserialize") != std::string::npos) {
+      static bool loaded = false;
+      if (!loaded) { loaded = true; fgo_http::play_load_config(); }
+      if (fgo_http::g_play.armed && !fgo_http::g_play.done) {
+        /* Fire on the login reply: by then the game holds a live authKey, and
+         * the bot reuses that session (it never logs in itself — a second
+         * login/top answers 97 invalid_user and takes the account away from
+         * the running game).  The reply is a huge string; only its first few
+         * kilobytes are needed to find the marker. */
+        static const char marker[] = "\"nid\":\"login\"";
+        for (uint64_t arg : {a1, a2}) {
+          const std::string head = il2cpp_text(arg);
+          if (head.size() < sizeof marker) continue;
+          if (std::search(head.begin(), head.begin() + std::min<size_t>(head.size(), 4096),
+                          marker, marker + sizeof marker - 1) != head.begin() + std::min<size_t>(head.size(), 4096)) {
+            fgo_http::play_run();
+            break;
+          }
+        }
+      }
+    }
+    /* The JSON parser's input is the whole reply text.  Saved as it is, without
+     * pairing it to a request: the request files carry the URL.  The game parses
+     * thousands of small JSON strings, so this is off unless LUNARIA_FGO_JSON is
+     * set; the bot and the reply-NNN.txt files do not need it. */
+    static const bool save_json = lunaria_env("LUNARIA_FGO_JSON") != nullptr;
+    if (!save_json) return;
+    for (uint64_t arg : {a1, a2}) {
+      const std::string text = il2cpp_text(arg);
+      if (text.size() < 2 || (text[0] != '{' && text[0] != '[')) continue;
+      static int seq = 0;
+      const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+      if (!dir || !*dir) dir = "fgo-http";
+      mkdir(dir, 0755);
+      char path[512];
+      snprintf(path, sizeof path, "%s/json-%03d.txt", dir, ++seq);
+      if (FILE *f = fopen(path, "wb")) {
+        fprintf(f, "(%s input)\n\n", w.name.c_str());
+        fwrite(text.data(), 1, text.size(), f);
+        fclose(f);
+      }
+      fprintf(stderr, "[fgo-http] json %zu bytes -> %s\n", text.size(), path);
+      break;
+    }
+    return;
+  }
+  if (w.name.find("CatGame5Bytes") != std::string::npos) {
+    /* CatAndMouseGame.CatGame5Bytes(byte[]): the MessagePack of the battle result,
+     * before the cipher; the input is written whole. */
+    const std::string data = array_bytes(a1);
+    static int seq = 0;
+    const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+    if (!dir || !*dir) dir = "fgo-http";
+    mkdir(dir, 0755);
+    char path[512];
+    snprintf(path, sizeof path, "%s/catgame5-in-%03d.bin", dir, ++seq);
+    if (FILE *f = fopen(path, "wb")) {
+      fwrite(data.data(), 1, data.size(), f);
+      fclose(f);
+    }
+    fprintf(stderr, "[fgo-http] CatGame5Bytes input %zu bytes -> %s\n", data.size(), path);
+    return;
+  }
+  if (w.name.find("ToBase64") != std::string::npos) {
+    /* ByteCompressor.ToBase64Str(byte[]): the bytes that become the request's
+     * text.  Written whole, so the plaintext before encryption can be read. */
+    const std::string data = array_bytes(a1);
+    static int seq = 0;
+    const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+    if (!dir || !*dir) dir = "fgo-http";
+    mkdir(dir, 0755);
+    char path[512];
+    snprintf(path, sizeof path, "%s/tobase64-%03d.bin", dir, ++seq);
+    if (FILE *f = fopen(path, "wb")) {
+      fwrite(data.data(), 1, data.size(), f);
+      fclose(f);
+    }
+    fprintf(stderr, "[fgo-http] ToBase64Str %zu bytes -> %s\n", data.size(), path);
+    return;
+  }
+  if (w.name.find("SendWebRequest") != std::string::npos) {
+    FgoRequest r;
+    auto it = s_req.find(a1);
+    if (it != s_req.end()) { r = it->second; s_req.erase(it); }
+    r.headers.insert(r.headers.end(), s_building.headers.begin(), s_building.headers.end());
+    if (r.form.empty()) r.form = s_building.form;
+    s_building = FgoRequest();
+    s_building_obj = 0;
+    fprintf(stderr, "[fgo-http] SendWebRequest req=%#llx body=%zu\n",
+            (unsigned long long)a1, r.body.size());
+    if (r.method.empty()) r.method = r.body.empty() ? "GET" : "POST";
+    if (r.url.find("http") == std::string::npos) r.url = s_last_url;
+    /* Only the game's API calls are paired with replies: images and asset
+     * downloads would otherwise sit in the queue and take the replies. */
+    if (r.url.find("login/top") != std::string::npos) {
+      /* The exact login form the game signed and sent: the bot resends it with
+       * fresh idempotencyKey/authCode/userState/lastAccessTime. */
+      const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+      if (!dir || !*dir) dir = "fgo-http";
+      mkdir(dir, 0755);
+      FILE *lf = fopen((std::string(dir) + "/login-form.txt").c_str(), "w");
+      if (lf) {
+        fprintf(lf, "%s %s\n", r.method.c_str(), r.url.c_str());
+        for (const auto &kv : r.form) fprintf(lf, "%s=%s\n", kv.first.c_str(), kv.second.c_str());
+        fclose(lf);
+        fprintf(stderr, "[fgo-http] login form saved (%zu fields)\n", r.form.size());
+      }
+    }
+    if (r.url.find("game.fate-go.us") != std::string::npos) {
+      save_request_file(r);
+      if (s_sent.size() < 64) s_sent.push_back(r);
+    }
+    if (s_armed) fprintf(stderr, "[fgo-http] request sent: %s %s\n", r.method.c_str(), r.url.c_str());
+    s_armed = false;
+    return;
+  }
+  if (w.name.find("SetRequestHeader") != std::string::npos) {
+    std::string name, value;
+    if (read_string((GuestVA)a1, name) && read_string((GuestVA)a2, value)) {
+      s_building.headers.emplace_back(name, value);
+      /* The bot runs on the game's session, which the server ties to this
+       * cookie; hand it over so play.py can send the same one. */
+      if (name.size() == 6 && strcasecmp(name.c_str(), "Cookie") == 0) {
+        const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+        if (!dir || !*dir) dir = "fgo-http";
+        mkdir(dir, 0755);
+        std::string path = std::string(dir) + "/session-cookie.txt";
+        if (FILE *f = fopen(path.c_str(), "wb")) {
+          fwrite(value.data(), 1, value.size(), f);
+          fclose(f);
+        }
+      }
+    }
+    return;
+  }
+  if (w.name.find("addField") != std::string::npos) {
+    std::string key, value;
+    if (read_string((GuestVA)a1, key)) {
+      if (!read_string((GuestVA)a2, value))
+        value = std::to_string((int32_t)(uint32_t)a2); /* an int field, e.g. userState */
+      s_building.form.emplace_back(key, value);
+      s_req[s_building_obj].form.emplace_back(key, value);
+    }
+    return;
+  }
+  /* Post only names the method; nothing is sent until SendWebRequest. */
+  if (w.name.find("Post") != std::string::npos) return;
+  std::string t1, t2;
+  const bool s1 = read_string((GuestVA)a1, t1);
+  const bool s2 = read_string((GuestVA)a2, t2);
+  fprintf(stderr, "[fgo-http] %s(%s%s%s%s%s%s)", w.name.c_str(),
+          s1 ? "\"" : "", s1 ? t1.c_str() : "", s1 ? "\"" : "",
+          s2 ? ", \"" : "", s2 ? t2.c_str() : "", s2 ? "\"" : "");
+  /* Arguments that are not strings are shown raw, so a wrong guess about the
+   * signature is visible in the log instead of silently printing nothing. */
+  if (!s1 || !s2) fprintf(stderr, "  raw a1=%#llx a2=%#llx", (unsigned long long)a1, (unsigned long long)a2);
+  fprintf(stderr, "\n");
+  for (uint64_t raw : {a1, a2}) {
+    if (read_string((GuestVA)raw, t1)) continue;
+    const uint8_t *m = g_ctx->mem.try_ptr((GuestVA)raw, 0x30);
+    if (!m) continue;
+    fprintf(stderr, "[fgo-http]   words at %#llx:", (unsigned long long)raw);
+    for (int k = 0; k < 6; ++k) {
+      uint64_t v;
+      std::memcpy(&v, m + 8 * k, 8);
+      fprintf(stderr, " %#llx", (unsigned long long)v);
+    }
+    fprintf(stderr, "\n");
+  }
+}
+
+/* Called from generated code just before a RET, with x0 as the result. */
+static void host_return(uint64_t idx, uint64_t r0) {
+  if (idx >= s_watch.size()) return;
+  const Watch &w = s_watch[idx];
+  if (w.name.find("get_data") != std::string::npos) {
+    save_body(r0);
+    return;
+  }
+  if (w.name.find("GetAuthCode") != std::string::npos) {
+    std::string code;
+    if (read_string(r0, code) && code.size() >= 16) {
+      const char *dir = lunaria_env("LUNARIA_FGO_HTTP_DIR");
+      if (!dir || !*dir) dir = "fgo-http";
+      mkdir(dir, 0755);
+      FILE *f = fopen((std::string(dir) + "/authcode.txt").c_str(), "w");
+      if (f) { fputs(code.c_str(), f); fclose(f); }
+      fprintf(stderr, "[fgo-http] authCode captured\n");
+    }
+    return;
+  }
+  if (w.name.find("get_text") != std::string::npos) {
+    save_reply_bytes(il2cpp_text(r0));
+    return;
+  }
+  if (w.name.find("Concat") != std::string::npos) {
+    /* Only the URL-building concats are of interest, and only while armed. */
+    std::string text;
+    if (read_string((GuestVA)r0, text) && text.rfind("https://", 0) == 0 && text.size() < 512) {
+      s_last_url = text;
+      if (s_armed) fprintf(stderr, "[fgo-http] url: %s\n", text.c_str());
+    }
+    return;
+  }
+  std::string text;
+  if (read_string((GuestVA)r0, text))
+    fprintf(stderr, "[fgo-http] %s -> \"%s\"\n", w.name.c_str(), text.c_str());
+  else
+    fprintf(stderr, "[fgo-http] %s -> (not a string)\n", w.name.c_str());
+}
+
+/* Translation-time placement: entry watchers get a host call at their first
+ * instruction, return watchers at every RET in their first kBodyBytes. */
+static void translate_hook(uint64_t pc, Dynarmic::A64::IREmitter &ir) {
+  if (!enabled() || !g_ctx) return;
+  if (!s_ready) resolve_once();
+  if (!s_ready || pc < s_lo || pc > s_hi + kBodyBytes) return;
+  for (size_t i = 0; i < s_watch.size(); ++i) {
+    const Watch &w = s_watch[i];
+    if (!w.on_return) {
+      /* UnityWebRequest methods take the URL as x0 (statics) or x1 (set_url, an
+       * instance method whose x0 is the request); RequestBase.addField takes
+       * key and value as x1 and x2. */
+      if (pc == w.va) {
+        /* (x0, x1) for String.Concat(a, b), Post and Create (static, URL in x0)
+         * and set_url (instance: x0 is the request, x1 the URL); (x1, x2) for
+         * instance methods with two arguments (SetRequestHeader, set_method,
+         * RequestBase.addField). */
+        const bool unity = w.name.find("Concat") != std::string::npos ||
+                           w.name.find("Post") != std::string::npos ||
+                           w.name.find("Create") != std::string::npos ||
+                           w.name.find("set_url") != std::string::npos ||
+                           w.name.find("set_method") != std::string::npos ||
+                           w.name.find("ToBase64") != std::string::npos ||
+                           w.name.find("CatGame5Bytes") != std::string::npos ||
+                           w.name.find("Deserialize") != std::string::npos ||
+                           w.name.find("getDictionary") != std::string::npos ||
+                           w.name.find("EncryptDecrypt") != std::string::npos ||
+                           w.name.find("SetUploadHandler") != std::string::npos ||
+                           w.name.find("set_uploadHandler") != std::string::npos ||
+                           w.name.find("SendWebRequest") != std::string::npos ||
+                           (w.name.find("UploadHandlerRaw") != std::string::npos &&
+                            w.name.find("Create") == std::string::npos);
+        ir.CallHostFunction(host_entry, ir.Imm64(i),
+                            ir.GetX(unity ? Dynarmic::A64::Reg::R0 : Dynarmic::A64::Reg::R1),
+                            ir.GetX(unity ? Dynarmic::A64::Reg::R1 : Dynarmic::A64::Reg::R2));
+      }
+      continue;
+    }
+    if (pc < w.va || pc >= w.va + kBodyBytes) continue;
+    const uint8_t *code = g_ctx->mem.try_ptr((GuestVA)pc, 4);
+    if (!code) continue;
+    uint32_t insn;
+    std::memcpy(&insn, code, 4);
+    if ((insn & 0xfffffc1fu) == 0xd65f0000u)  /* RET Xn */
+      ir.CallHostFunction(host_return, ir.Imm64(i), ir.GetX(Dynarmic::A64::Reg::R0));
+  }
+}
+}  // namespace fgo_http
+
 class Arm64Callbacks : public Dynarmic::A64::UserCallbacks {
+  /* LUNARIA_FGO_HTTP placement: see fgo_http::translate_hook. */
+  void PreCodeTranslationHook(uint64_t pc, Dynarmic::A64::IREmitter &ir) override {
+    fgo_http::translate_hook(pc, ir);
+  }
 public:
   ArmExecCtx *ctx = nullptr;
   Dynarmic::A64::Jit *jit64 = nullptr;

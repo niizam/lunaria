@@ -23,6 +23,8 @@ IR::Block Translate(LocationDescriptor descriptor, MemoryReadCodeFuncType memory
     do {
         const u64 pc = visitor.ir.current_location->PC();
 
+        if (visitor.options.pre_code_hook) visitor.options.pre_code_hook(pc, visitor.ir);
+
         if (const auto instruction = memory_read_code(pc)) {
             if (auto decoder = Decode<TranslatorVisitor>(*instruction)) {
                 should_continue = decoder->get().call(visitor, *instruction);

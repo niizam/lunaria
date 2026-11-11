@@ -21,6 +21,8 @@ class LocationDescriptor;
 
 using MemoryReadCodeFuncType = std::function<std::optional<u32>(u64 vaddr)>;
 
+class IREmitter;
+
 struct TranslationOptions {
     /// This changes what IR we emit when we translate an unpredictable instruction.
     /// If this is false, the ExceptionRaised IR instruction is emitted.
@@ -35,6 +37,10 @@ struct TranslationOptions {
     /// If this is false, YIELD becomes a host processor hint; other hints are NOPs.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// Run before each guest instruction is decoded; see
+    /// UserCallbacks::PreCodeTranslationHook. Empty means no hook.
+    std::function<void(u64 pc, IREmitter& ir)> pre_code_hook;
 };
 
 /**

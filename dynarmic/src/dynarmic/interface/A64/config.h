@@ -81,8 +81,16 @@ enum class InstructionCacheOperation {
     InvalidateAllToPoUInnerSharable
 };
 
+class IREmitter;
+
 struct UserCallbacks {
     virtual ~UserCallbacks() = default;
+
+    /// Called while a guest instruction is being translated, before it is decoded
+    /// (the A32 frontend's PreCodeTranslationHook, for A64). IR emitted through `ir`
+    /// runs each time that instruction does, including when the block is entered by
+    /// a linked jump that never returns to the dispatcher. Default: nothing.
+    virtual void PreCodeTranslationHook(VAddr /*pc*/, IREmitter& /*ir*/) {}
 
     // All reads through this callback are 4-byte aligned.
     // Memory must be interpreted as little endian.
